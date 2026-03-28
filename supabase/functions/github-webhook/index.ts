@@ -4,7 +4,7 @@
  * When a PR is opened or synchronized, this function:
  *   1. Verifies the HMAC-SHA256 signature using GITHUB_WEBHOOK_SECRET
  *   2. Fetches all commits in the PR from the GitHub API
- *   3. Queries cursor_sessions where commit_shas contains any of those SHAs
+ *   3. Queries cursor_sessions AND claude_sessions where commit_shas contains any of those SHAs
  *   4. Posts a formatted comment on the PR showing which AI prompts generated the code
  *   5. Updates the matched sessions with github_pr_number, github_pr_url, github_pr_comment_id
  *
@@ -49,9 +49,34 @@ interface CursorSession {
   context_tokens_used: number | null;
   total_lines_added: number | null;
   total_lines_removed: number | null;
+  commit_shas: string[] | null;
   github_pr_comment_id: number | null;
   project_id: string | null;
   user_id: string | null;
+}
+
+interface ClaudeSession {
+  session_id: string;
+  project_name: string | null;
+  model_name: string | null;
+  exchange_count: number | null;
+  total_input_tokens: number | null;
+  total_output_tokens: number | null;
+  commit_shas: string[] | null;
+  github_pr_comment_id: number | null;
+  project_id: string | null;
+}
+
+interface MatchedSession {
+  session_id: string;
+  source: "cursor" | "claude-code";
+  name: string;
+  model: string;
+  mode: string | null;
+  contextTokensK: string | null;
+  linesAdded: number;
+  linesRemoved: number;
+  project_id: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,8 +120,37 @@ async function fetchPRCommits(
   return shas;
 }
 
+function normalizeCursorSession(s: CursorSession): MatchedSession {
+  return {
+    session_id: s.session_id,
+    source: "cursor",
+    name: s.name ?? "Unnamed session",
+    model: s.model_name ?? "unknown model",
+    mode: s.unified_mode ?? "agent",
+    contextTokensK: s.context_tokens_used ? `${Math.round(s.context_tokens_used / 1000)}k` : null,
+    linesAdded: s.total_lines_added ?? 0,
+    linesRemoved: s.total_lines_removed ?? 0,
+    project_id: s.project_id,
+  };
+}
+
+function normalizeClaudeSession(s: ClaudeSession): MatchedSession {
+  const totalTokens = (s.total_input_tokens ?? 0) + (s.total_output_tokens ?? 0);
+  return {
+    session_id: s.session_id,
+    source: "claude-code",
+    name: s.project_name ?? "Unnamed session",
+    model: s.model_name ?? "unknown model",
+    mode: "claude-code",
+    contextTokensK: totalTokens > 0 ? `${Math.round(totalTokens / 1000)}k` : null,
+    linesAdded: 0,
+    linesRemoved: 0,
+    project_id: s.project_id,
+  };
+}
+
 function formatPRComment(
-  sessions: CursorSession[],
+  sessions: MatchedSession[],
   prTitle: string,
   prUrl: string,
   supabaseUrl: string
@@ -110,21 +164,16 @@ function formatPRComment(
   ];
 
   for (const session of sessions) {
-    const name      = session.name ?? "Unnamed session";
-    const model     = session.model_name ?? "unknown model";
-    const mode      = session.unified_mode ?? "agent";
-    const ctxK      = session.context_tokens_used ? `${Math.round(session.context_tokens_used / 1000)}k` : null;
-    const added     = session.total_lines_added ?? 0;
-    const removed   = session.total_lines_removed ?? 0;
     const sessionUrl = `${appUrl}/projects/${session.project_id ?? "_"}/sessions/${session.session_id}`;
 
-    lines.push(`**Session: "${name}"**`);
+    lines.push(`**Session: "${session.name}"**`);
     lines.push(
       [
-        `Model: \`${model}\``,
-        `Mode: \`${mode}\``,
-        ctxK ? `Context: ${ctxK} tokens` : null,
-        (added > 0 || removed > 0) ? `+${added} −${removed} lines` : null,
+        `Model: \`${session.model}\``,
+        `Source: \`${session.source}\``,
+        session.contextTokensK ? `Tokens: ${session.contextTokensK}` : null,
+        (session.linesAdded > 0 || session.linesRemoved > 0)
+          ? `+${session.linesAdded} −${session.linesRemoved} lines` : null,
       ].filter(Boolean).join(" · ")
     );
     lines.push("");
@@ -214,43 +263,40 @@ Deno.serve(async (req) => {
     return new Response("No commits found in PR", { status: 200 });
   }
 
-  // Find sessions that overlap with these commits and haven't been commented on yet
-  const { data: sessions } = await supabase
-    .from("cursor_sessions")
-    .select("session_id, name, model_name, unified_mode, context_tokens_used, total_lines_added, total_lines_removed, github_pr_comment_id, project_id, user_id")
-    .eq("project_id", projectRow.id)
-    .is("github_pr_comment_id", null)
-    .filter("commit_shas", "not.is", null);
-
-  if (!sessions?.length) {
-    return new Response("No uncommitted sessions found", { status: 200 });
-  }
-
-  // Filter to sessions whose commit_shas intersect with the PR's commits
+  // Query cursor_sessions and claude_sessions in parallel for matching commits
   const prShaSet = new Set(prCommitShas);
-  const { data: allSessions } = await supabase
-    .from("cursor_sessions")
-    .select("session_id, commit_shas, name, model_name, unified_mode, context_tokens_used, total_lines_added, total_lines_removed, github_pr_comment_id, project_id, user_id")
-    .eq("project_id", projectRow.id)
-    .is("github_pr_comment_id", null)
-    .not("commit_shas", "is", null);
 
-  const matchedSessions: CursorSession[] = (allSessions ?? []).filter((s) => {
-    const sessionShas: string[] = s.commit_shas ?? [];
-    return sessionShas.some((sha: string) => prShaSet.has(sha));
-  });
+  const [{ data: rawCursorSessions }, { data: rawClaudeSessions }] = await Promise.all([
+    supabase
+      .from("cursor_sessions")
+      .select("session_id, commit_shas, name, model_name, unified_mode, context_tokens_used, total_lines_added, total_lines_removed, github_pr_comment_id, project_id, user_id")
+      .eq("project_id", projectRow.id)
+      .is("github_pr_comment_id", null)
+      .not("commit_shas", "is", null),
+    supabase
+      .from("claude_sessions")
+      .select("session_id, commit_shas, project_name, model_name, exchange_count, total_input_tokens, total_output_tokens, github_pr_comment_id, project_id")
+      .eq("project_id", projectRow.id)
+      .is("github_pr_comment_id", null)
+      .not("commit_shas", "is", null),
+  ]);
+
+  const matchedCursor: MatchedSession[] = (rawCursorSessions ?? [])
+    .filter((s) => (s.commit_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
+    .map(normalizeCursorSession);
+
+  const matchedClaude: MatchedSession[] = (rawClaudeSessions ?? [])
+    .filter((s) => (s.commit_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
+    .map(normalizeClaudeSession);
+
+  const matchedSessions = [...matchedCursor, ...matchedClaude];
 
   if (matchedSessions.length === 0) {
     return new Response("No sessions match this PR's commits", { status: 200 });
   }
 
   // Post comment
-  const commentBody = formatPRComment(
-    matchedSessions,
-    pr.title,
-    pr.html_url,
-    supabaseUrl
-  );
+  const commentBody = formatPRComment(matchedSessions, pr.title, pr.html_url, supabaseUrl);
 
   const commentRes = await fetch(
     `https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`,
@@ -275,17 +321,25 @@ Deno.serve(async (req) => {
   const commentId: number = comment.id;
   const prUrl = pr.html_url;
 
-  // Update matched sessions with PR info
-  for (const session of matchedSessions) {
-    await supabase.rpc("set_session_pr", {
-      p_session_id: session.session_id,
-      p_pr_number:  prNumber,
-      p_pr_url:     prUrl,
-      p_comment_id: commentId,
-    });
-  }
+  // Mark matched sessions so they aren't included in future PR sync events
+  await Promise.all([
+    ...matchedCursor.map((s) =>
+      supabase.rpc("set_session_pr", {
+        p_session_id: s.session_id,
+        p_pr_number:  prNumber,
+        p_pr_url:     prUrl,
+        p_comment_id: commentId,
+      })
+    ),
+    ...(matchedClaude.length > 0
+      ? [supabase
+          .from("claude_sessions")
+          .update({ github_pr_comment_id: commentId, github_pr_number: prNumber, github_pr_url: prUrl })
+          .in("session_id", matchedClaude.map((s) => s.session_id))]
+      : []),
+  ]);
 
-  console.log(`Posted PR comment #${commentId} for ${matchedSessions.length} sessions`);
+  console.log(`Posted PR comment #${commentId} for ${matchedSessions.length} sessions (cursor: ${matchedCursor.length}, claude: ${matchedClaude.length})`);
   return new Response(JSON.stringify({ ok: true, sessions: matchedSessions.length, commentId }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
