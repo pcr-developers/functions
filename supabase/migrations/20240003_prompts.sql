@@ -7,6 +7,7 @@ DROP TRIGGER IF EXISTS auto_content_hash ON prompts;
 
 CREATE TABLE IF NOT EXISTS prompts (
   id              uuid PRIMARY KEY,
+  content_hash    text NOT NULL,
   bundle_id       text,
   user_id         uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   project_id      uuid REFERENCES projects(id) ON DELETE SET NULL,
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 
 -- Add columns that may be missing if the table already existed
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS content_hash  text;
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS bundle_id     text;
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS session_id    text;
 ALTER TABLE prompts ADD COLUMN IF NOT EXISTS response_text text;
