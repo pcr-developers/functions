@@ -109,6 +109,8 @@ BEGIN
     )
     ON CONFLICT (id) DO UPDATE SET
       bundle_id     = COALESCE(EXCLUDED.bundle_id,     prompts.bundle_id),
+      project_id    = COALESCE(EXCLUDED.project_id,    prompts.project_id),
+      branch_name   = COALESCE(EXCLUDED.branch_name,   prompts.branch_name),
       response_text = COALESCE(EXCLUDED.response_text, prompts.response_text),
       tool_calls    = COALESCE(EXCLUDED.tool_calls,    prompts.tool_calls),
       model         = COALESCE(EXCLUDED.model,         prompts.model);
