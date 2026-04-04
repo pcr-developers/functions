@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS claude_bundles (
   updated_at           timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE claude_bundles ADD COLUMN IF NOT EXISTS items jsonb;
+ALTER TABLE claude_bundles DROP COLUMN IF EXISTS items;
 
 CREATE INDEX IF NOT EXISTS claude_bundles_project_id_idx   ON claude_bundles (project_id);
 CREATE INDEX IF NOT EXISTS claude_bundles_user_id_idx      ON claude_bundles (user_id);
