@@ -4,7 +4,7 @@
  * When a PR is opened or synchronized, this function:
  *   1. Verifies the HMAC-SHA256 signature using GITHUB_WEBHOOK_SECRET
  *   2. Fetches all commits in the PR from the GitHub API
- *   3. Queries cursor_sessions AND claude_bundles where session_shas contains any of those SHAs
+ *   3. Queries cursor_sessions AND bundles where session_shas contains any of those SHAs
  *   4. Posts a formatted comment on the PR showing which AI prompts generated the code
  *   5. Updates the matched sessions with github_pr_number, github_pr_url, github_pr_comment_id
  *
@@ -55,14 +55,14 @@ interface CursorSession {
   user_id: string | null;
 }
 
-interface ClaudeBundle {
+interface Bundle {
   bundle_id: string;
   message: string;
   project_name: string | null;
   exchange_count: number | null;
   session_shas: string[] | null;
   github_pr_comment_id: number | null;
-  project_id: string | null;
+  bundle_projects: { project_id: string }[];
 }
 
 interface MatchedSession {
@@ -132,7 +132,7 @@ function normalizeCursorSession(s: CursorSession): MatchedSession {
   };
 }
 
-function normalizeClaudeBundle(b: ClaudeBundle): MatchedSession {
+function normalizeBundle(b: Bundle): MatchedSession {
   return {
     session_id: b.bundle_id,
     source: "claude-code",
@@ -142,7 +142,7 @@ function normalizeClaudeBundle(b: ClaudeBundle): MatchedSession {
     contextTokensK: b.exchange_count ? `${b.exchange_count} prompts` : null,
     linesAdded: 0,
     linesRemoved: 0,
-    project_id: b.project_id,
+    project_id: b.bundle_projects?.[0]?.project_id ?? null,
   };
 }
 
@@ -262,10 +262,10 @@ Deno.serve(async (req) => {
     return new Response("No commits found in PR", { status: 200 });
   }
 
-  // Query cursor_sessions and claude_bundles in parallel for matching commits
+  // Query cursor_sessions and bundles in parallel for matching commits
   const prShaSet = new Set(prCommitShas);
 
-  const [{ data: rawCursorSessions }, { data: rawClaudeBundles }] = await Promise.all([
+  const [{ data: rawCursorSessions }, { data: rawBundles }] = await Promise.all([
     supabase
       .from("cursor_sessions")
       .select("session_id, commit_shas, name, model_name, unified_mode, context_tokens_used, total_lines_added, total_lines_removed, github_pr_comment_id, project_id, user_id")
@@ -273,9 +273,9 @@ Deno.serve(async (req) => {
       .is("github_pr_comment_id", null)
       .not("commit_shas", "is", null),
     supabase
-      .from("claude_bundles")
-      .select("bundle_id, message, project_name, exchange_count, session_shas, github_pr_comment_id, project_id")
-      .eq("project_id", projectRow.id)
+      .from("bundles")
+      .select("bundle_id, message, project_name, exchange_count, session_shas, github_pr_comment_id, bundle_projects!inner(project_id)")
+      .eq("bundle_projects.project_id", projectRow.id)
       .is("github_pr_comment_id", null)
       .not("session_shas", "is", null),
   ]);
@@ -284,9 +284,9 @@ Deno.serve(async (req) => {
     .filter((s) => (s.commit_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
     .map(normalizeCursorSession);
 
-  const matchedClaude: MatchedSession[] = (rawClaudeBundles ?? [])
+  const matchedClaude: MatchedSession[] = (rawBundles ?? [])
     .filter((b) => (b.session_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
-    .map(normalizeClaudeBundle);
+    .map(normalizeBundle);
 
   const matchedSessions = [...matchedCursor, ...matchedClaude];
 
@@ -332,7 +332,7 @@ Deno.serve(async (req) => {
     ),
     ...(matchedClaude.length > 0
       ? [supabase
-          .from("claude_bundles")
+          .from("bundles")
           .update({ github_pr_comment_id: commentId, github_pr_number: prNumber, github_pr_url: prUrl })
           .in("bundle_id", matchedClaude.map((s) => s.session_id))]
       : []),
