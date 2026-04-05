@@ -14,6 +14,7 @@
  *   SUPABASE_SERVICE_ROLE_KEY — auto-provided; used to bypass RLS for cross-user queries
  */
 
+// PCR.dev GitHub webhook handler
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // ---------------------------------------------------------------------------
