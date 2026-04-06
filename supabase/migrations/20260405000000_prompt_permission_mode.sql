@@ -1,0 +1,1 @@
+ALTER TABLE prompts ADD COLUMN IF NOT EXISTS permission_mode TEXT;
