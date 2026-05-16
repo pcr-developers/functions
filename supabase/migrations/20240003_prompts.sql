@@ -1,5 +1,5 @@
--- Drop pre-existing trigger that used pgcrypto for content hashing.
--- content_hash is now computed by the CLI before push.
+-- Drop pre-existing trigger that used pgcrypto for content hashing
+-- content_hash is now computed by the CLI before push
 DROP TRIGGER IF EXISTS auto_content_hash ON prompts;
 
 -- prompts: one row per prompt, the main data table.
