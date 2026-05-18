@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS project_invites (
   email        text,
   github_login text,
   role         text NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
-  token        text NOT NULL UNIQUE DEFAULT encode(gen_random_bytes(32), 'hex'),
+  token        text NOT NULL UNIQUE DEFAULT encode(extensions.gen_random_bytes(32), 'hex'),
   invited_by   uuid REFERENCES auth.users(id) ON DELETE SET NULL,
   expires_at   timestamptz NOT NULL DEFAULT (now() + interval '14 days'),
   accepted_at  timestamptz,
