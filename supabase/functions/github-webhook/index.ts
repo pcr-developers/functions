@@ -276,13 +276,14 @@ Deno.serve(async (req) => {
     // The auth gate for this endpoint is the HMAC signature verified above.
     const supabase = createClient(supabaseUrl, serviceKey);
 
-    // Find a PCR project whose repo_url references this repository. The
-    // substring (`ilike %…%`) match is intentionally loose to tolerate variants
-    // like trailing slashes, `.git` suffixes, or mixed protocol prefixes.
+    // Find the PCR project for this repository via the normalised
+    // `repo_full_name` generated column (= "<owner>/<repo>"). Exact equality
+    // prevents cross-project substring collisions (e.g. `acme/foo` matching
+    // `acme/foo-fork`) that the previous `ilike %…%` filter allowed.
     const { data: projectRow, error: projectErr } = await supabase
       .from("projects")
       .select("id, created_by")
-      .or(`repo_url.ilike.%${repoFullName}%,repo_url.ilike.%${repository.html_url}%`)
+      .eq("repo_full_name", repoFullName)
       .limit(1)
       .maybeSingle();
 
