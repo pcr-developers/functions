@@ -78,6 +78,11 @@ interface MatchedSession {
   project_id: string | null;
 }
 
+// First-line marker on every comment we post (see formatPRComment). Used to
+// recognise a prior PCR comment on a PR so we don't double-post when the
+// previous delivery's GitHub POST succeeded but the follow-up RPC failed.
+const PCR_COMMENT_BODY_PREFIX = "## PCR.dev — AI Prompts for this PR";
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -137,6 +142,51 @@ async function fetchPRCommits(
     page++;
   }
   return shas;
+}
+
+// Look for an existing PCR-authored comment on the PR. Used to make the
+// "post comment then write back comment_id" flow idempotent: if a prior
+// delivery posted the comment but the DB write-back failed, the next
+// `synchronize` event would otherwise post a duplicate. Returns the comment
+// id to reuse, or null when no match is found.
+//
+// Matching: body starts with `PCR_COMMENT_BODY_PREFIX` AND (when we know the
+// bot/token owner's GitHub login) user.login equals it. If the login is
+// unknown we fall back to body-prefix-only matching — still safe because the
+// prefix is specific to our format.
+async function findExistingPcrComment(
+  repoFullName: string,
+  prNumber: number,
+  token: string,
+  botLogin: string | null,
+): Promise<{ id: number; login: string | null } | null> {
+  // Issue comments on a PR can grow large; paginate defensively with a hard
+  // cap matching fetchPRCommits.
+  const MAX_PAGES = 10;
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const res = await fetch(
+      `https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+      { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json" } }
+    );
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.error(`findExistingPcrComment failed page=${page} status=${res.status} body=${errBody.slice(0, 500)}`);
+      // Fail open: returning null lets the caller proceed with a fresh POST.
+      // A duplicate is preferable to dropping the comment entirely.
+      return null;
+    }
+    const comments: Array<{ id: number; body?: string; user?: { login?: string } }> = await res.json();
+    if (comments.length === 0) return null;
+    for (const c of comments) {
+      const body = c.body ?? "";
+      if (!body.startsWith(PCR_COMMENT_BODY_PREFIX)) continue;
+      const login = c.user?.login ?? null;
+      if (botLogin && login !== botLogin) continue;
+      return { id: c.id, login };
+    }
+    if (comments.length < 100) return null;
+  }
+  return null;
 }
 
 function normalizeCursorSession(s: CursorSession): MatchedSession {
@@ -298,7 +348,7 @@ Deno.serve(async (req) => {
 
     const { data: ghConn, error: ghErr } = await supabase
       .from("github_connections")
-      .select("access_token")
+      .select("access_token, github_login")
       .eq("user_id", projectRow.created_by)
       .maybeSingle();
 
@@ -312,6 +362,7 @@ Deno.serve(async (req) => {
     }
 
     const token = ghConn.access_token;
+    const botLogin: string | null = ghConn.github_login ?? null;
 
     const prCommitShas = await fetchPRCommits(repoFullName, prNumber, token);
     if (prCommitShas.length === 0) {
@@ -354,28 +405,45 @@ Deno.serve(async (req) => {
 
     const commentBody = formatPRComment(matchedSessions, pr.title, pr.html_url, supabaseUrl);
 
-    const commentRes = await fetch(
-      `https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `token ${token}`,
-          Accept: "application/vnd.github.v3+json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ body: commentBody }),
-      }
-    );
-
-    if (!commentRes.ok) {
-      const err = await commentRes.text().catch(() => "");
-      console.error(`[${deliveryId}] Failed to post PR comment status=${commentRes.status} body=${err.slice(0, 500)}`);
-      return new Response("Failed to post comment", { status: 502 });
-    }
-
-    const comment = await commentRes.json();
-    const commentId: number = comment.id;
+    // Idempotency guard: if a previous delivery already posted a PCR comment
+    // on this PR (GitHub POST succeeded but the follow-up RPC failed, so
+    // matched sessions still have github_pr_comment_id = NULL), reuse that
+    // comment's id instead of posting a duplicate. The follow-up RPC below
+    // will then back-fill the missing comment_id so the next synchronize
+    // event short-circuits before this point.
+    let commentId: number;
     const prUrl = pr.html_url;
+    const existing = await findExistingPcrComment(repoFullName, prNumber, token, botLogin);
+    if (existing) {
+      commentId = existing.id;
+      console.log(
+        `[${deliveryId}] reusing existing PCR comment #${commentId} on ${repoFullName}#${prNumber} ` +
+        `(login=${existing.login ?? "unknown"}, sessions=${matchedSessions.length}); ` +
+        `skipping POST and back-filling github_pr_comment_id`
+      );
+    } else {
+      const commentRes = await fetch(
+        `https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `token ${token}`,
+            Accept: "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ body: commentBody }),
+        }
+      );
+
+      if (!commentRes.ok) {
+        const err = await commentRes.text().catch(() => "");
+        console.error(`[${deliveryId}] Failed to post PR comment status=${commentRes.status} body=${err.slice(0, 500)}`);
+        return new Response("Failed to post comment", { status: 502 });
+      }
+
+      const comment = await commentRes.json();
+      commentId = comment.id;
+    }
 
     // Mark matched sessions so they aren't re-posted on the next synchronize.
     // Cursor sessions go through a single batched RPC (one UPDATE server-side)
