@@ -82,6 +82,18 @@ interface MatchedSession {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Constant-time string comparison. Returns false immediately for length mismatch
+// (the lengths themselves are not secret), then compares byte-by-byte without
+// short-circuiting to avoid leaking signature contents via timing.
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 async function verifyGitHubSignature(
   secret: string,
   body: string,
@@ -94,7 +106,7 @@ async function verifyGitHubSignature(
   );
   const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
   const hex = Array.from(new Uint8Array(mac)).map(b => b.toString(16).padStart(2, "0")).join("");
-  return `sha256=${hex}` === signature;
+  return timingSafeEqual(`sha256=${hex}`, signature);
 }
 
 async function fetchPRCommits(
@@ -104,12 +116,20 @@ async function fetchPRCommits(
 ): Promise<string[]> {
   const shas: string[] = [];
   let page = 1;
-  while (true) {
+  // GitHub returns the first 250 commits via /pulls/{n}/commits; PRs larger
+  // than that require the compare API. Cap pages defensively to avoid runaway
+  // loops if the API misbehaves.
+  const MAX_PAGES = 10;
+  while (page <= MAX_PAGES) {
     const res = await fetch(
       `https://api.github.com/repos/${repoFullName}/pulls/${prNumber}/commits?per_page=100&page=${page}`,
       { headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json" } }
     );
-    if (!res.ok) break;
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.error(`fetchPRCommits failed page=${page} status=${res.status} body=${errBody.slice(0, 500)}`);
+      throw new Error(`GitHub commits API returned ${res.status}`);
+    }
     const commits: GitHubCommit[] = await res.json();
     if (commits.length === 0) break;
     shas.push(...commits.map(c => c.sha));
@@ -190,158 +210,203 @@ function formatPRComment(
 // Handler
 // ---------------------------------------------------------------------------
 
+// Minimal shape guard — payload is only trusted *after* HMAC verification, but
+// we still validate the fields we destructure so a malformed payload returns a
+// clean 400 instead of throwing a 500 with a noisy stack trace.
+function isValidPullRequestEvent(p: unknown): p is PullRequestEvent {
+  if (typeof p !== "object" || p === null) return false;
+  const o = p as Record<string, unknown>;
+  if (typeof o.action !== "string" || typeof o.number !== "number") return false;
+  const pr = o.pull_request as Record<string, unknown> | undefined;
+  const repo = o.repository as Record<string, unknown> | undefined;
+  if (!pr || typeof pr.html_url !== "string" || typeof pr.title !== "string") return false;
+  if (!repo || typeof repo.full_name !== "string" || typeof repo.html_url !== "string") return false;
+  return true;
+}
+
 Deno.serve(async (req) => {
-  const webhookSecret = Deno.env.get("GITHUB_WEBHOOK_SECRET");
-  const supabaseUrl   = Deno.env.get("SUPABASE_URL")!;
-  const serviceKey    = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  try {
+    const webhookSecret = Deno.env.get("GITHUB_WEBHOOK_SECRET");
+    const supabaseUrl   = Deno.env.get("SUPABASE_URL");
+    const serviceKey    = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-  if (!webhookSecret) {
-    return new Response("GITHUB_WEBHOOK_SECRET not configured", { status: 500 });
-  }
-
-  // Only handle POST
-  if (req.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
-  }
-
-  const rawBody = await req.text();
-  const signature = req.headers.get("x-hub-signature-256");
-  const event     = req.headers.get("x-github-event");
-
-  // Verify HMAC signature
-  const valid = await verifyGitHubSignature(webhookSecret, rawBody, signature);
-  if (!valid) {
-    return new Response("Invalid signature", { status: 401 });
-  }
-
-  // Only process pull_request events we care about
-  if (event !== "pull_request") {
-    return new Response("Ignored", { status: 200 });
-  }
-
-  const payload: PullRequestEvent = JSON.parse(rawBody);
-  if (!["opened", "synchronize", "reopened"].includes(payload.action)) {
-    return new Response("Ignored action", { status: 200 });
-  }
-
-  const { pull_request: pr, repository, number: prNumber } = payload;
-  const repoFullName = repository.full_name;
-
-  // Service-role client — bypasses RLS so we can query across all users
-  const supabase = createClient(supabaseUrl, serviceKey);
-
-  // Find a GitHub token from any user who has connected GitHub and owns a
-  // project whose repo_url matches this repository.
-  const { data: projectRow } = await supabase
-    .from("projects")
-    .select("id, created_by")
-    .or(`repo_url.ilike.%${repoFullName}%,repo_url.ilike.%${repository.html_url}%`)
-    .limit(1)
-    .single();
-
-  if (!projectRow) {
-    console.log(`No PCR project found for repo ${repoFullName}`);
-    return new Response("No matching project", { status: 200 });
-  }
-
-  const { data: ghConn } = await supabase
-    .from("github_connections")
-    .select("access_token")
-    .eq("user_id", projectRow.created_by)
-    .single();
-
-  if (!ghConn?.access_token) {
-    console.log("No GitHub token found for project owner");
-    return new Response("No GitHub connection", { status: 200 });
-  }
-
-  const token = ghConn.access_token;
-
-  // Fetch all commits in this PR
-  const prCommitShas = await fetchPRCommits(repoFullName, prNumber, token);
-  if (prCommitShas.length === 0) {
-    return new Response("No commits found in PR", { status: 200 });
-  }
-
-  // Query cursor_sessions and bundles in parallel for matching commits
-  const prShaSet = new Set(prCommitShas);
-
-  const [{ data: rawCursorSessions }, { data: rawBundles }] = await Promise.all([
-    supabase
-      .from("cursor_sessions")
-      .select("session_id, commit_shas, name, model_name, unified_mode, context_tokens_used, total_lines_added, total_lines_removed, github_pr_comment_id, project_id, user_id")
-      .eq("project_id", projectRow.id)
-      .is("github_pr_comment_id", null)
-      .not("commit_shas", "is", null),
-    supabase
-      .from("bundles")
-      .select("bundle_id, message, project_name, exchange_count, session_shas, github_pr_comment_id, bundle_projects!inner(project_id)")
-      .eq("bundle_projects.project_id", projectRow.id)
-      .is("github_pr_comment_id", null)
-      .not("session_shas", "is", null),
-  ]);
-
-  const matchedCursor: MatchedSession[] = (rawCursorSessions ?? [])
-    .filter((s) => (s.commit_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
-    .map(normalizeCursorSession);
-
-  const matchedClaude: MatchedSession[] = (rawBundles ?? [])
-    .filter((b) => (b.session_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
-    .map(normalizeBundle);
-
-  const matchedSessions = [...matchedCursor, ...matchedClaude];
-
-  if (matchedSessions.length === 0) {
-    return new Response("No sessions match this PR's commits", { status: 200 });
-  }
-
-  // Post comment
-  const commentBody = formatPRComment(matchedSessions, pr.title, pr.html_url, supabaseUrl);
-
-  const commentRes = await fetch(
-    `https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: "application/vnd.github.v3+json",
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ body: commentBody }),
+    if (!webhookSecret || !supabaseUrl || !serviceKey) {
+      console.error("Missing required env: GITHUB_WEBHOOK_SECRET / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
+      return new Response("Server misconfigured", { status: 500 });
     }
-  );
 
-  if (!commentRes.ok) {
-    const err = await commentRes.text();
-    console.error("Failed to post comment:", err);
-    return new Response("Failed to post comment", { status: 500 });
+    if (req.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    const rawBody = await req.text();
+    const signature = req.headers.get("x-hub-signature-256");
+    const event     = req.headers.get("x-github-event");
+    const deliveryId = req.headers.get("x-github-delivery") ?? "unknown";
+
+    const valid = await verifyGitHubSignature(webhookSecret, rawBody, signature);
+    if (!valid) {
+      return new Response("Invalid signature", { status: 401 });
+    }
+
+    if (event !== "pull_request") {
+      return new Response("Ignored", { status: 200 });
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      console.error(`[${deliveryId}] Malformed JSON payload`);
+      return new Response("Malformed JSON", { status: 400 });
+    }
+    if (!isValidPullRequestEvent(payload)) {
+      console.error(`[${deliveryId}] Invalid pull_request payload shape`);
+      return new Response("Invalid payload", { status: 400 });
+    }
+
+    if (!["opened", "synchronize", "reopened"].includes(payload.action)) {
+      return new Response("Ignored action", { status: 200 });
+    }
+
+    const { pull_request: pr, repository, number: prNumber } = payload;
+    const repoFullName = repository.full_name;
+
+    // Service-role client — bypasses RLS so we can query across all users.
+    // The auth gate for this endpoint is the HMAC signature verified above.
+    const supabase = createClient(supabaseUrl, serviceKey);
+
+    // Find a PCR project whose repo_url references this repository. The
+    // substring (`ilike %…%`) match is intentionally loose to tolerate variants
+    // like trailing slashes, `.git` suffixes, or mixed protocol prefixes.
+    const { data: projectRow, error: projectErr } = await supabase
+      .from("projects")
+      .select("id, created_by")
+      .or(`repo_url.ilike.%${repoFullName}%,repo_url.ilike.%${repository.html_url}%`)
+      .limit(1)
+      .maybeSingle();
+
+    if (projectErr) {
+      console.error(`[${deliveryId}] projects lookup error`, projectErr);
+      return new Response("Database error", { status: 500 });
+    }
+    if (!projectRow) {
+      console.log(`[${deliveryId}] No PCR project found for repo ${repoFullName}`);
+      return new Response("No matching project", { status: 200 });
+    }
+
+    const { data: ghConn, error: ghErr } = await supabase
+      .from("github_connections")
+      .select("access_token")
+      .eq("user_id", projectRow.created_by)
+      .maybeSingle();
+
+    if (ghErr) {
+      console.error(`[${deliveryId}] github_connections lookup error`, ghErr);
+      return new Response("Database error", { status: 500 });
+    }
+    if (!ghConn?.access_token) {
+      console.log(`[${deliveryId}] No GitHub token for project owner ${projectRow.created_by}`);
+      return new Response("No GitHub connection", { status: 200 });
+    }
+
+    const token = ghConn.access_token;
+
+    const prCommitShas = await fetchPRCommits(repoFullName, prNumber, token);
+    if (prCommitShas.length === 0) {
+      return new Response("No commits found in PR", { status: 200 });
+    }
+
+    const prShaSet = new Set(prCommitShas);
+
+    const [cursorRes, bundlesRes] = await Promise.all([
+      supabase
+        .from("cursor_sessions")
+        .select("session_id, commit_shas, name, model_name, unified_mode, context_tokens_used, total_lines_added, total_lines_removed, github_pr_comment_id, project_id, user_id")
+        .eq("project_id", projectRow.id)
+        .is("github_pr_comment_id", null)
+        .not("commit_shas", "is", null),
+      supabase
+        .from("bundles")
+        .select("bundle_id, message, project_name, exchange_count, session_shas, github_pr_comment_id, bundle_projects!inner(project_id)")
+        .eq("bundle_projects.project_id", projectRow.id)
+        .is("github_pr_comment_id", null)
+        .not("session_shas", "is", null),
+    ]);
+
+    if (cursorRes.error) console.error(`[${deliveryId}] cursor_sessions query error`, cursorRes.error);
+    if (bundlesRes.error) console.error(`[${deliveryId}] bundles query error`, bundlesRes.error);
+
+    const matchedCursor: MatchedSession[] = (cursorRes.data ?? [])
+      .filter((s) => (s.commit_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
+      .map(normalizeCursorSession);
+
+    const matchedClaude: MatchedSession[] = (bundlesRes.data ?? [])
+      .filter((b) => (b.session_shas as string[] ?? []).some((sha: string) => prShaSet.has(sha)))
+      .map(normalizeBundle);
+
+    const matchedSessions = [...matchedCursor, ...matchedClaude];
+
+    if (matchedSessions.length === 0) {
+      return new Response("No sessions match this PR's commits", { status: 200 });
+    }
+
+    const commentBody = formatPRComment(matchedSessions, pr.title, pr.html_url, supabaseUrl);
+
+    const commentRes = await fetch(
+      `https://api.github.com/repos/${repoFullName}/issues/${prNumber}/comments`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `token ${token}`,
+          Accept: "application/vnd.github.v3+json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ body: commentBody }),
+      }
+    );
+
+    if (!commentRes.ok) {
+      const err = await commentRes.text().catch(() => "");
+      console.error(`[${deliveryId}] Failed to post PR comment status=${commentRes.status} body=${err.slice(0, 500)}`);
+      return new Response("Failed to post comment", { status: 502 });
+    }
+
+    const comment = await commentRes.json();
+    const commentId: number = comment.id;
+    const prUrl = pr.html_url;
+
+    // Mark matched sessions so they aren't re-posted on the next synchronize.
+    // RPC results don't throw — we inspect each result so any DB failure is
+    // logged with the delivery id rather than silently swallowed.
+    const updates = await Promise.all([
+      ...matchedCursor.map((s) =>
+        supabase.rpc("set_session_pr", {
+          p_session_id: s.session_id,
+          p_pr_number:  prNumber,
+          p_pr_url:     prUrl,
+          p_comment_id: commentId,
+        }).then((r) => ({ kind: "cursor" as const, id: s.session_id, error: r.error }))
+      ),
+      ...(matchedClaude.length > 0
+        ? [supabase
+            .from("bundles")
+            .update({ github_pr_comment_id: commentId, github_pr_number: prNumber, github_pr_url: prUrl })
+            .in("bundle_id", matchedClaude.map((s) => s.session_id))
+            .then((r) => ({ kind: "bundles" as const, id: "<batch>", error: r.error }))]
+        : []),
+    ]);
+    for (const u of updates) {
+      if (u.error) console.error(`[${deliveryId}] post-comment update failed kind=${u.kind} id=${u.id}`, u.error);
+    }
+
+    console.log(`[${deliveryId}] Posted PR comment #${commentId} for ${matchedSessions.length} sessions (cursor: ${matchedCursor.length}, claude: ${matchedClaude.length})`);
+    return new Response(JSON.stringify({ ok: true, sessions: matchedSessions.length, commentId }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.error("Unhandled webhook error", err);
+    return new Response("Internal error", { status: 500 });
   }
-
-  const comment = await commentRes.json();
-  const commentId: number = comment.id;
-  const prUrl = pr.html_url;
-
-  // Mark matched sessions so they aren't included in future PR sync events
-  await Promise.all([
-    ...matchedCursor.map((s) =>
-      supabase.rpc("set_session_pr", {
-        p_session_id: s.session_id,
-        p_pr_number:  prNumber,
-        p_pr_url:     prUrl,
-        p_comment_id: commentId,
-      })
-    ),
-    ...(matchedClaude.length > 0
-      ? [supabase
-          .from("bundles")
-          .update({ github_pr_comment_id: commentId, github_pr_number: prNumber, github_pr_url: prUrl })
-          .in("bundle_id", matchedClaude.map((s) => s.session_id))]
-      : []),
-  ]);
-
-  console.log(`Posted PR comment #${commentId} for ${matchedSessions.length} sessions (cursor: ${matchedCursor.length}, claude: ${matchedClaude.length})`);
-  return new Response(JSON.stringify({ ok: true, sessions: matchedSessions.length, commentId }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
 });
