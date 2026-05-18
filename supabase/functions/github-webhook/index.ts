@@ -378,17 +378,21 @@ Deno.serve(async (req) => {
     const prUrl = pr.html_url;
 
     // Mark matched sessions so they aren't re-posted on the next synchronize.
+    // Cursor sessions go through a single batched RPC (one UPDATE server-side)
+    // instead of N round trips; the bundle update was already a single query.
     // RPC results don't throw — we inspect each result so any DB failure is
     // logged with the delivery id rather than silently swallowed.
     const updates = await Promise.all([
-      ...matchedCursor.map((s) =>
-        supabase.rpc("set_session_pr", {
-          p_session_id: s.session_id,
-          p_pr_number:  prNumber,
-          p_pr_url:     prUrl,
-          p_comment_id: commentId,
-        }).then((r) => ({ kind: "cursor" as const, id: s.session_id, error: r.error }))
-      ),
+      ...(matchedCursor.length > 0
+        ? [supabase
+            .rpc("set_sessions_pr_batch", {
+              p_session_ids: matchedCursor.map((s) => s.session_id),
+              p_pr_number:   prNumber,
+              p_pr_url:      prUrl,
+              p_comment_id:  commentId,
+            })
+            .then((r) => ({ kind: "cursor" as const, id: "<batch>", error: r.error }))]
+        : []),
       ...(matchedClaude.length > 0
         ? [supabase
             .from("bundles")
